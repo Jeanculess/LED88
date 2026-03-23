@@ -5,6 +5,15 @@
  *  Cloud:   Arduino IoT Cloud — OTA + 3 dashboard variables
  *  Display: MD_Parola / MD_MAX72XX, scrolling marquee
  *
+ *  Flicker-free design:
+ *    • HTTP fetches run on Core 0 (FreeRTOS task) so the
+ *      display loop on Core 1 is never blocked.
+ *    • Scroll text is double-buffered; the active buffer is
+ *      swapped only at a clean animation-cycle boundary, so
+ *      MD_Parola never sees a mid-scroll pointer change.
+ *    • All shared state (td[], numTickers, pendingBuf) is
+ *      protected by a FreeRTOS mutex.
+ *
  *  Wiring (ESP32 → MAX7219):
  *    VCC → VIN   GND → GND
  *    DIN → GPIO23 (MOSI)   CLK → GPIO18 (SCK)   CS → GPIO5
@@ -53,7 +62,6 @@ static const uint8_t GLYPH_DN[] = { 5, 0x20, 0x60, 0xFC, 0x60, 0x20 };
 //  Timing
 // ═══════════════════════════════════════════════════════════
 #define POLL_MS 20000UL
-unsigned long lastPoll = 0;
 
 // ═══════════════════════════════════════════════════════════
 //  Ticker data
@@ -69,15 +77,26 @@ struct TickerData {
 };
 
 TickerData td[MAX_TICKERS];
-int  numTickers   = 0;
-char scrollBuf[256];
-bool needRefetch  = false;
+int        numTickers = 0;
+
+// ── FreeRTOS concurrency ─────────────────────────────────
+//  dataMutex guards: td[], numTickers, pendingBuf, pendingUpdate
+static SemaphoreHandle_t dataMutex       = NULL;
+static TaskHandle_t      fetchTaskHandle = NULL;
+
+// Double-buffered scroll text.
+// fetchTask writes into pendingBuf then sets pendingUpdate = true.
+// loop() swaps pendingBuf → activeBuf only at an animation boundary.
+static char          activeBuf   [256];
+static char          pendingBuf  [256];
+static volatile bool pendingUpdate = false;
 
 // ── Forward declarations ─────────────────────────────────
 void parseTickers();
 void fetchAll();
-bool fetchOne(TickerData &t);
+bool fetchOne(TickerData &t, const String &sym);
 void buildScroll();
+void fetchTask(void *param);
 
 // ═══════════════════════════════════════════════════════════
 //  SETUP
@@ -100,28 +119,61 @@ void setup() {
   matrix.addChar(CHR_UP, GLYPH_UP);
   matrix.addChar(CHR_DN, GLYPH_DN);
 
-  strcpy(scrollBuf, "Connecting...");
-  matrix.displayText(scrollBuf, PA_LEFT, scrollSpeed, 0,
+  strcpy(activeBuf, "Connecting...");
+  matrix.displayText(activeBuf, PA_LEFT, scrollSpeed, 0,
                      PA_SCROLL_LEFT, PA_SCROLL_LEFT);
 
+  // Create mutex before starting the fetch task
+  dataMutex = xSemaphoreCreateMutex();
+  if (!dataMutex) {
+    Serial.println("ERROR: failed to create mutex — halting");
+    while (true) delay(1000);
+  }
+
   parseTickers();
+
+  // Fetch task runs on Core 0; display loop stays on Core 1
+  if (xTaskCreatePinnedToCore(fetchTask, "FetchTask", 8192, NULL, 1,
+                              &fetchTaskHandle, 0) != pdPASS) {
+    Serial.println("ERROR: failed to create FetchTask — halting");
+    while (true) delay(1000);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
-//  LOOP
+//  LOOP  (Core 1 — never blocks, always drives the display)
 // ═══════════════════════════════════════════════════════════
 void loop() {
   ArduinoCloud.update();
 
-  if (needRefetch || (millis() - lastPoll >= POLL_MS)) {
+  if (matrix.displayAnimate()) {
+    // Swap in the new message only at a clean animation boundary
+    // to avoid any mid-scroll visual glitch.
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    if (pendingUpdate) {
+      memcpy(activeBuf, pendingBuf, sizeof(activeBuf));
+      pendingUpdate = false;
+      xSemaphoreGive(dataMutex);
+      matrix.displayText(activeBuf, PA_LEFT, scrollSpeed, 0,
+                         PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+    } else {
+      xSemaphoreGive(dataMutex);
+      matrix.displayReset();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FETCH TASK  (Core 0 — handles all network I/O)
+//  Fetches immediately on start, then every POLL_MS, or sooner
+//  if woken by xTaskNotifyGive (e.g. from onTickersChange).
+// ═══════════════════════════════════════════════════════════
+void fetchTask(void *param) {
+  while (true) {
     fetchAll();
     buildScroll();
-    lastPoll    = millis();
-    needRefetch = false;
-  }
-
-  if (matrix.displayAnimate()) {
-    matrix.displayReset();
+    // Wait up to POLL_MS for an early wake-up notification
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POLL_MS));
   }
 }
 
@@ -129,6 +181,7 @@ void loop() {
 //  PARSE TICKERS — "AMZN.TO,XEQT.TO" → td[]
 // ═══════════════════════════════════════════════════════════
 void parseTickers() {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
   numTickers = 0;
   String s = tickers;
   s.trim();
@@ -148,6 +201,7 @@ void parseTickers() {
     }
     s = (comma >= 0) ? s.substring(comma + 1) : "";
   }
+  xSemaphoreGive(dataMutex);
   Serial.printf("Parsed %d ticker(s)\n", numTickers);
 }
 
@@ -155,19 +209,28 @@ void parseTickers() {
 //  FETCH ALL
 // ═══════════════════════════════════════════════════════════
 void fetchAll() {
-  for (int i = 0; i < numTickers; i++) {
-    fetchOne(td[i]);
-    if (i < numTickers - 1) delay(250);
+  // Snapshot symbol strings under lock so we never hold the mutex
+  // across a blocking network call.
+  String syms[MAX_TICKERS];
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  int n = numTickers;
+  for (int i = 0; i < n; i++) syms[i] = td[i].symbol;
+  xSemaphoreGive(dataMutex);
+
+  for (int i = 0; i < n; i++) {
+    fetchOne(td[i], syms[i]);
+    if (i < n - 1) delay(250);
   }
 }
 
 // ═══════════════════════════════════════════════════════════
 //  FETCH ONE — Yahoo Finance v8 chart endpoint
+//  sym is pre-snapshotted by the caller (fetchAll) under mutex.
 // ═══════════════════════════════════════════════════════════
-bool fetchOne(TickerData &t) {
+bool fetchOne(TickerData &t, const String &sym) {
   HTTPClient http;
   String url = "https://query1.finance.yahoo.com/v8/finance/chart/"
-               + t.symbol + "?interval=1d&range=1d";
+               + sym + "?interval=1d&range=1d";
 
   http.begin(url);
   http.addHeader("User-Agent", "ESP32-MatrixTicker/1.0");
@@ -176,7 +239,7 @@ bool fetchOne(TickerData &t) {
 
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("  [%s] HTTP %d\n", t.symbol.c_str(), code);
+    Serial.printf("  [%s] HTTP %d\n", sym.c_str(), code);
     http.end();
     return false;
   }
@@ -191,7 +254,7 @@ bool fetchOne(TickerData &t) {
   http.end();
 
   if (err) {
-    Serial.printf("  [%s] JSON: %s\n", t.symbol.c_str(), err.c_str());
+    Serial.printf("  [%s] JSON: %s\n", sym.c_str(), err.c_str());
     return false;
   }
 
@@ -200,24 +263,29 @@ bool fetchOne(TickerData &t) {
   float prevClose = meta["chartPreviousClose"] | 0.0f;
 
   if (price > 0.0f && prevClose > 0.0f) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
     t.price = price;
     t.pct   = ((price - prevClose) / prevClose) * 100.0f;
     t.valid = true;
-    Serial.printf("  [%s] %.2f  %+.1f%%\n",
-                  t.symbol.c_str(), t.price, t.pct);
+    xSemaphoreGive(dataMutex);
+    Serial.printf("  [%s] %.2f  %+.1f%%\n", sym.c_str(), price, t.pct);
     return true;
   }
   return false;
 }
 
 // ═══════════════════════════════════════════════════════════
-//  BUILD SCROLL STRING
+//  BUILD SCROLL STRING → pendingBuf
 //  Format:  AMZN 28.45 ▲1.3%     XEQT 35.12 ▼0.4%
+//  Writes into pendingBuf under mutex and sets pendingUpdate.
+//  The display loop will swap it in at the next animation boundary.
 // ═══════════════════════════════════════════════════════════
 void buildScroll() {
   String msg = "";
 
-  for (int i = 0; i < numTickers; i++) {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  int n = numTickers;
+  for (int i = 0; i < n; i++) {
     if (!td[i].valid) continue;
     if (msg.length() > 0) msg += "     ";
 
@@ -230,16 +298,18 @@ void buildScroll() {
              fabsf(td[i].pct));
     msg += buf;
   }
+  xSemaphoreGive(dataMutex);
 
   if (msg.length() == 0) msg = "Waiting for data...";
 
   msg += "     ";
 
-  msg.toCharArray(scrollBuf, sizeof(scrollBuf));
-  matrix.displayText(scrollBuf, PA_LEFT, scrollSpeed, 0,
-                     PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  msg.toCharArray(pendingBuf, sizeof(pendingBuf));
+  pendingUpdate = true;
+  xSemaphoreGive(dataMutex);
 
-  Serial.printf("Scroll: %s\n", scrollBuf);
+  Serial.printf("Scroll ready: %s\n", pendingBuf);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -248,7 +318,8 @@ void buildScroll() {
 void onTickersChange() {
   Serial.printf("Cloud > tickers = %s\n", tickers.c_str());
   parseTickers();
-  needRefetch = true;
+  // Wake the fetch task immediately instead of waiting for the next poll
+  if (fetchTaskHandle) xTaskNotifyGive(fetchTaskHandle);
 }
 
 void onScrollSpeedChange() {
