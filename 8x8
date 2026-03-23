@@ -1,0 +1,264 @@
+/*
+ *  MatrixTicker — ESP32 + MAX7219 4-in-1 LED Stock Scroller
+ *  ─────────────────────────────────────────────────────────
+ *  Data:    Yahoo Finance (no API key, polling ~20s)
+ *  Cloud:   Arduino IoT Cloud — OTA + 3 dashboard variables
+ *  Display: MD_Parola / MD_MAX72XX, scrolling marquee
+ *
+ *  Wiring (ESP32 → MAX7219):
+ *    VCC → VIN   GND → GND
+ *    DIN → GPIO23 (MOSI)   CLK → GPIO18 (SCK)   CS → GPIO5
+ *
+ *  ──────────────────────────────────────────────────────────
+ *  Arduino IoT Cloud — create these 3 variables in your Thing:
+ *
+ *    Name          Type      Permission
+ *    ─────────────────────────────────────
+ *    tickers       String    Read & Write
+ *    scrollSpeed   int       Read & Write
+ *    brightness    int       Read & Write
+ *
+ *  Libraries to add in Cloud IDE (Library Manager):
+ *    - ArduinoJson
+ *    - MD_Parola
+ *    - MD_MAX72XX
+ *  ──────────────────────────────────────────────────────────
+ */
+
+#include "thingProperties.h"
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+// ═══════════════════════════════════════════════════════════
+//  MAX7219 config
+// ═══════════════════════════════════════════════════════════
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES   4
+#define CS_PIN        5
+
+MD_Parola matrix = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+
+// ═══════════════════════════════════════════════════════════
+//  Custom arrow glyphs  ▲ ▼
+// ═══════════════════════════════════════════════════════════
+static const uint8_t GLYPH_UP[] = { 5, 0x04, 0x06, 0x3F, 0x06, 0x04 };
+static const uint8_t GLYPH_DN[] = { 5, 0x20, 0x60, 0xFC, 0x60, 0x20 };
+#define CHR_UP '\x01'
+#define CHR_DN '\x02'
+
+// ═══════════════════════════════════════════════════════════
+//  Timing
+// ═══════════════════════════════════════════════════════════
+#define POLL_MS 20000UL
+unsigned long lastPoll = 0;
+
+// ═══════════════════════════════════════════════════════════
+//  Ticker data
+// ═══════════════════════════════════════════════════════════
+#define MAX_TICKERS 5
+
+struct TickerData {
+  String symbol;
+  String label;
+  float  price    = 0.0f;
+  float  pct      = 0.0f;
+  bool   valid    = false;
+};
+
+TickerData td[MAX_TICKERS];
+int  numTickers   = 0;
+char scrollBuf[256];
+bool needRefetch  = false;
+
+// ── Forward declarations ─────────────────────────────────
+void parseTickers();
+void fetchAll();
+bool fetchOne(TickerData &t);
+void buildScroll();
+
+// ═══════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n── MatrixTicker ──");
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  // Defaults on first boot
+  if (tickers.length() == 0)  tickers     = "AMZN.TO,XEQT.TO";
+  if (scrollSpeed == 0)       scrollSpeed  = 40;
+  if (brightness  <= 0)       brightness   = 4;
+
+  matrix.begin();
+  matrix.setIntensity(constrain(brightness, 0, 15));
+  matrix.addChar(CHR_UP, GLYPH_UP);
+  matrix.addChar(CHR_DN, GLYPH_DN);
+
+  strcpy(scrollBuf, "Connecting...");
+  matrix.displayText(scrollBuf, PA_LEFT, scrollSpeed, 0,
+                     PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+
+  parseTickers();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════
+void loop() {
+  ArduinoCloud.update();
+
+  if (needRefetch || (millis() - lastPoll >= POLL_MS)) {
+    fetchAll();
+    buildScroll();
+    lastPoll    = millis();
+    needRefetch = false;
+  }
+
+  if (matrix.displayAnimate()) {
+    matrix.displayReset();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  PARSE TICKERS — "AMZN.TO,XEQT.TO" → td[]
+// ═══════════════════════════════════════════════════════════
+void parseTickers() {
+  numTickers = 0;
+  String s = tickers;
+  s.trim();
+
+  while (s.length() > 0 && numTickers < MAX_TICKERS) {
+    int comma = s.indexOf(',');
+    String sym = (comma >= 0) ? s.substring(0, comma) : s;
+    sym.trim();
+    sym.toUpperCase();
+
+    if (sym.length() > 0) {
+      td[numTickers].symbol = sym;
+      int dot = sym.indexOf('.');
+      td[numTickers].label  = (dot > 0) ? sym.substring(0, dot) : sym;
+      td[numTickers].valid  = false;
+      numTickers++;
+    }
+    s = (comma >= 0) ? s.substring(comma + 1) : "";
+  }
+  Serial.printf("Parsed %d ticker(s)\n", numTickers);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FETCH ALL
+// ═══════════════════════════════════════════════════════════
+void fetchAll() {
+  for (int i = 0; i < numTickers; i++) {
+    fetchOne(td[i]);
+    if (i < numTickers - 1) delay(250);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FETCH ONE — Yahoo Finance v8 chart endpoint
+// ═══════════════════════════════════════════════════════════
+bool fetchOne(TickerData &t) {
+  HTTPClient http;
+  String url = "https://query1.finance.yahoo.com/v8/finance/chart/"
+               + t.symbol + "?interval=1d&range=1d";
+
+  http.begin(url);
+  http.addHeader("User-Agent", "ESP32-MatrixTicker/1.0");
+  http.addHeader("Accept", "application/json");
+  http.setTimeout(8000);
+
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("  [%s] HTTP %d\n", t.symbol.c_str(), code);
+    http.end();
+    return false;
+  }
+
+  JsonDocument filter;
+  filter["chart"]["result"][0]["meta"]["regularMarketPrice"] = true;
+  filter["chart"]["result"][0]["meta"]["chartPreviousClose"] = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(
+      doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+
+  if (err) {
+    Serial.printf("  [%s] JSON: %s\n", t.symbol.c_str(), err.c_str());
+    return false;
+  }
+
+  JsonObject meta = doc["chart"]["result"][0]["meta"];
+  float price     = meta["regularMarketPrice"] | 0.0f;
+  float prevClose = meta["chartPreviousClose"] | 0.0f;
+
+  if (price > 0.0f && prevClose > 0.0f) {
+    t.price = price;
+    t.pct   = ((price - prevClose) / prevClose) * 100.0f;
+    t.valid = true;
+    Serial.printf("  [%s] %.2f  %+.1f%%\n",
+                  t.symbol.c_str(), t.price, t.pct);
+    return true;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BUILD SCROLL STRING
+//  Format:  AMZN 28.45 ▲1.3%     XEQT 35.12 ▼0.4%
+// ═══════════════════════════════════════════════════════════
+void buildScroll() {
+  String msg = "";
+
+  for (int i = 0; i < numTickers; i++) {
+    if (!td[i].valid) continue;
+    if (msg.length() > 0) msg += "     ";
+
+    char arrow = (td[i].pct >= 0.0f) ? CHR_UP : CHR_DN;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s %.2f %c%.1f%%",
+             td[i].label.c_str(),
+             td[i].price,
+             arrow,
+             fabsf(td[i].pct));
+    msg += buf;
+  }
+
+  if (msg.length() == 0) msg = "Waiting for data...";
+
+  msg += "     ";
+
+  msg.toCharArray(scrollBuf, sizeof(scrollBuf));
+  matrix.displayText(scrollBuf, PA_LEFT, scrollSpeed, 0,
+                     PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+
+  Serial.printf("Scroll: %s\n", scrollBuf);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLOUD CALLBACKS
+// ═══════════════════════════════════════════════════════════
+void onTickersChange() {
+  Serial.printf("Cloud > tickers = %s\n", tickers.c_str());
+  parseTickers();
+  needRefetch = true;
+}
+
+void onScrollSpeedChange() {
+  scrollSpeed = constrain(scrollSpeed, 20, 150);
+  matrix.setSpeed(scrollSpeed);
+  Serial.printf("Cloud > speed = %d\n", scrollSpeed);
+}
+
+void onBrightnessChange() {
+  brightness = constrain(brightness, 0, 15);
+  matrix.setIntensity(brightness);
+  Serial.printf("Cloud > brightness = %d\n", brightness);
+}
